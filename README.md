@@ -2,7 +2,8 @@
 
 An equity swing trading system built around the **MeanTF** indicator — four
 price-mean levels that define dynamic support and resistance zones on any
-intraday or daily chart.
+daily chart. Enhanced with **DSS Bressert + Lyapunov HP** regime filters
+for directional gating.
 
 ---
 
@@ -10,8 +11,8 @@ intraday or daily chart.
 
 1. [Strategy Overview](#1-strategy-overview)
 2. [The Four Mean Levels](#2-the-four-mean-levels)
-3. [Confluence Scoring](#3-confluence-scoring)
-4. [Break vs Bounce Setups](#4-break-vs-bounce-setups)
+3. [Regime Filter: DSS Bressert + Lyapunov HP](#3-regime-filter-dss-bressert--lyapunov-hp)
+4. [Live System Flow](#4-live-system-flow)
 5. [Backtest Results](#5-backtest-results)
 6. [Installation](#6-installation)
 7. [Repository Structure](#7-repository-structure)
@@ -24,150 +25,162 @@ intraday or daily chart.
 ## 1. Strategy Overview
 
 The Mean Levels strategy treats price means — computed at multiple timeframe
-resolutions — as natural support and resistance levels.  When two or more of
-these levels stack within 0.5 % of each other they form a **confluence zone**
-with measurable strength.  Traders enter either on a confirmed *break* through
-the zone (momentum) or a *bounce* off the zone (mean-reversion).
+resolutions — as natural support and resistance levels. Orders are placed as
+limit buys at each mean level below price, letting price come to you.
 
-Back-testing across 18 months on diversified US equities demonstrates that the
-**break-only variant** produces strong, consistent returns with extremely low
-drawdown:
+A **dual-indicator regime gate** (DSS Bressert + Lyapunov HP) ensures orders
+are only placed when both indicators agree on direction. This eliminates
+low-conviction setups and dramatically improves signal quality.
 
-| Metric | Value |
-|---|---|
-| Total Return | **+91.2 %** ($100 K → $191 K) |
-| Win Rate | **69.1 %** (618 W / 276 L) |
-| Profit Factor | **4.07** |
-| Max Drawdown | **0.59 %** |
-| Avg Win / Avg Loss | $196 / $108 (1.8 : 1) |
-| All 20 tickers profitable | ✓ |
-| All 19 months profitable | ✓ |
+The consolidated live system runs once daily at 9:00 AM ET:
+
+1. Cancel all stale open orders
+2. Compute regime (DSS + Lyapunov) for each ticker
+3. Compute Lua-faithful mean levels (CDM, PDM, CMM, PMM)
+4. Place limit buy orders at levels below price (BUY regime only)
+5. Attach protective stops at each level
+
+### v3 Backtest Highlights (18 months, 20 tickers)
+
+| Metric | v2 (no gate) | v3 (DSS+Lyap gate) |
+|---|---|---|
+| Return | +91.2% | **+135.8%** |
+| Trades | 894 | 1,740 |
+| Win Rate | 69.1% | 58.3% |
+| Profit Factor | 4.07 | 2.69 |
+| Max Drawdown | 0.6% | 2.1% |
 
 ---
 
 ## 2. The Four Mean Levels
 
-All levels are computed from **daily OHLC / Close data** obtained via
-[yfinance](https://github.com/ranaroussi/yfinance).
+All levels use the **Lua-faithful mean algorithm**: running cumulative close
+average per timeframe group (not OHLC/4 typical price).
 
 ### CDM — Current Day Mean
 ```
-CDM = mean(Open, High, Low, Close)  of the most recent (or current) trading day
+CDM = running average of Close values within the current trading day
 ```
-The intraday pivot.  Fastest-moving level; useful for identifying
-intraday momentum shifts.  Weight: **1 pt**.
+Fastest-moving level. Weight: **1 pt**.
 
 ### PDM — Previous Day Mean
 ```
-PDM = mean(Open, High, Low, Close)  of the previous trading day
+PDM = final running average of Close values from the previous trading day
 ```
-Yesterday's pivot becomes today's first S/R reference.  Frequently tested
-in the opening hour.  Weight: **2 pts**.
+Yesterday's pivot becomes today's first S/R reference. Weight: **2 pts**.
 
 ### CMM — Current Month Mean
 ```
-CMM = mean(daily Closes)  for all trading days so far in the current calendar month
+CMM = running average of Close values within the current calendar month
 ```
-Acts as a macro intramonth trend anchor.  When price is above CMM the
-monthly bias is bullish; below is bearish.  Weight: **3 pts**.
+Macro intramonth trend anchor. Weight: **3 pts**.
 
 ### PMM — Previous Month Mean
 ```
-PMM = mean(daily Closes)  for all trading days in the prior calendar month
+PMM = final running average of Close values from the prior calendar month
 ```
-The strongest level.  Represents the prior month's value area centre —
-respected by institutional algos.  Weight: **4 pts**.
+Strongest level — represents prior month's value area centre. Weight: **4 pts**.
 
 ---
 
-## 3. Confluence Scoring
+## 3. Regime Filter: DSS Bressert + Lyapunov HP
 
-A **confluence zone** forms when two or more levels fall within a configurable
-band (default **0.5 %**) of each other.
+Two indicators act as **hard gate filters**. If the regime is not BUY, no
+orders are placed for that ticker.
 
-```
-zone_price  = average price of all constituent levels
-band_lo     = zone_price × (1 − 0.005)
-band_hi     = zone_price × (1 + 0.005)
-zone_score  = sum of weights for each level in the zone
-```
+### DSS Bressert (Double Smoothed Stochastic)
+- Parameters: `stoch=13, smooth=8, signal=8`
+- Computes double-smoothed stochastic oscillator
+- Direction: BULLISH when DSS > Signal, BEARISH when DSS < Signal
+- Modeled on 8-hour bars (daily bars serve as proxy for equities)
 
-Example — PMM ($150.10) + CMM ($150.45) within 0.5 %:
-```
-zone_price  = 150.275
-zone_score  = PMM(4) + CMM(3) = 7  ← strong zone
-```
+### Lyapunov HP (Hodrick-Prescott Exponent)
+- Parameters: `filter=7, L_Period=525`
+- Estimates Lyapunov exponent via HP-filtered returns
+- Direction: BULLISH when exponent > 0 and rising, BEARISH when < 0 or falling
 
-A minimum score threshold (default **5**) filters out weak, single-level
-areas.
+### Gate Logic
+| DSS | Lyapunov | Regime | Action |
+|-----|----------|--------|--------|
+| BULLISH | BULLISH | **BUY** | Place limit orders at mean levels below price |
+| BEARISH | BEARISH | SELL | Skip (can't short on Public.com) |
+| Mixed / Neutral | Any | NEUTRAL | Skip (no edge) |
 
 ---
 
-## 4. Break vs Bounce Setups
+## 4. Live System Flow
 
-### BREAK setups (recommended, default)
+`mean_levels_live.py` is the consolidated single script:
 
-| Type | Trigger | Direction |
-|---|---|---|
-| `BREAK_LONG` | Previous close ≤ zone high **and** current close > zone high | Long |
-| `BREAK_SHORT` | Previous close ≥ zone low **and** current close < zone low | Short |
+```
+9:00 AM ET ──┐
+             │
+   ┌─────────▼──────────┐
+   │ Cancel stale orders │
+   └─────────┬──────────┘
+             │
+   ┌─────────▼──────────┐
+   │ For each ticker:    │
+   │  • Fetch 800d OHLCV │
+   │  • Compute regime   │
+   │  • Compute levels   │
+   └─────────┬──────────┘
+             │
+   ┌─────────▼──────────┐
+   │ Regime = BUY?       │
+   │  Y → Limit orders   │
+   │  N → Skip           │
+   └─────────┬──────────┘
+             │
+   ┌─────────▼──────────┐
+   │ Log to JSON         │
+   └────────────────────┘
+```
 
-Entry is taken on the **next bar's open** after the break candle closes.
+### Order Placement
+- Limit BUY at each mean level below current price
+- Skip levels > 5% below price (too far)
+- 0.7% protective stop below each level
+- Position sizing weighted by level strength (PMM=1.0×, CMM=0.75×, PDM=0.5×, CDM=0.25×)
+- DAY time-in-force (orders expire at close)
 
-**Why breaks-only outperforms:**
-Bounces require precise timing and suffer from false entries when a zone is
-tested multiple times before holding.  Breaks, by contrast, occur *after* the
-zone has absorbed sellers (long) or buyers (short) and price has committed to a
-new direction — producing higher-probability follow-through and fewer whipsaws.
-The backtest v2 configuration (breaks-only, 2 % risk) achieved:
-- Win rate 69.1 % vs ~54 % for bounce-only
-- Profit factor 4.07 vs 1.8 for bounce-only
-- Max drawdown 0.59 % vs 3.1 % for bounce-only
-
-### BOUNCE setups (optional, `--all-setups`)
-
-| Type | Trigger | Direction |
-|---|---|---|
-| `BOUNCE_LONG` | Price > zone, within 1 % proximity | Long |
-| `BOUNCE_SHORT` | Price < zone, within 1 % proximity | Short |
-
-Enable with `--all-setups` flag on any script.
+### Risk Parameters
+- 1% equity per trade
+- Max 3 orders per ticker
+- Long-only (Public.com constraint)
 
 ---
 
 ## 5. Backtest Results
 
-Configuration used for the headline numbers:
+### v3 Configuration (Lua-faithful + DSS/Lyap gate)
 
 ```
 Months:         18
 Equity:         $100,000
-Risk/trade:     2% of equity
-Stop-loss:      1× ATR (daily)
-Take-profit:    2× risk (1:2 R:R)
-Mode:           BREAKS ONLY
-Min score:      5
-Confluence:     0.5%
+Risk/trade:     1% of equity
+Stop-loss:      0.7% below level
+Mode:           BUY regime only (DSS+Lyap gate)
+Tickers:        20 (dynamic universe)
 ```
 
 | Stat | Value |
 |---|---|
-| Total Return | +91.2 % |
-| Win Rate | 69.1 % |
+| Total Return | +135.8% |
+| Win Rate | 58.3% |
+| Total Trades | 1,740 |
+| Profit Factor | 2.69 |
+| Max Drawdown | 2.1% |
+
+### v2 Configuration (breaks-only, no gate)
+
+| Stat | Value |
+|---|---|
+| Total Return | +91.2% |
+| Win Rate | 69.1% |
 | Total Trades | 894 |
 | Profit Factor | 4.07 |
-| Max Drawdown | 0.59 % |
-| Avg Win | $196 |
-| Avg Loss | $108 |
-| Expectancy | $105/trade |
-| Avg Hold | 2.1 bars |
-| All 20 tickers profitable | Yes |
-| All 19 months profitable | Yes |
-
-Reproduce with:
-```bash
-python3 mean_levels_backtest.py --breaks-only --risk-pct 0.02 --months 18 --equity 100000
-```
+| Max Drawdown | 0.59% |
 
 ---
 
@@ -176,6 +189,7 @@ python3 mean_levels_backtest.py --breaks-only --risk-pct 0.02 --months 18 --equi
 ### Prerequisites
 - Python 3.10 or newer
 - pip
+- Public.com API key (for live trading)
 
 ### Install dependencies
 
@@ -183,14 +197,10 @@ python3 mean_levels_backtest.py --breaks-only --risk-pct 0.02 --months 18 --equi
 pip install -r requirements.txt
 ```
 
-Or individually:
-
+Set your Public.com API secret:
 ```bash
-pip install yfinance numpy pandas matplotlib
+export PUBLIC_COM_SECRET="your_api_secret"
 ```
-
-No API keys are required.  All market data is sourced from Yahoo Finance via
-`yfinance`.
 
 ---
 
@@ -198,25 +208,55 @@ No API keys are required.  All market data is sourced from Yahoo Finance via
 
 ```
 mean-levels-strategy/
-├── mean_levels_scanner.py     # Core scanner – computes levels, zones, setups
-├── mean_levels_universe.py    # Dynamic universe selector (ranks ~110 names)
-├── mean_levels_backtest.py    # Walk-forward backtesting engine
-├── mean_levels_executor.py    # Live/paper order generator & state manager
+├── mean_levels_live.py          # Consolidated live system (regime → cancel → levels → orders)
+├── mean_levels_scanner.py       # Standalone scanner with DSS+Lyap gate + Lua-faithful means
+├── mean_levels_universe.py      # Dynamic universe selector (ranks ~110 names)
+├── mean_levels_executor.py      # Legacy multi-step executor (long-only)
+├── mean_levels_backtest.py      # v2 backtester (breaks/bounces, no gate)
+├── mean_levels_backtest_v3.py   # v3 backtester (Lua-faithful + DSS/Lyap gate)
+├── dss_bressert.py              # DSS Bressert indicator — Python port of Lua source
+├── lyapunov_hp.py               # Lyapunov HP indicator — Python port of Lua source
 ├── requirements.txt
 ├── README.md
-├── .gitignore
-└── backtest_results/          # Created on first backtest run
-    ├── trades.json
-    └── summary.json
+└── .gitignore
 ```
 
 ---
 
 ## 8. Usage
 
-### Scanner
+### Consolidated Live System (Recommended)
 
-Scan the default 30-ticker universe:
+Dry run (default) — computes everything, shows orders, places nothing:
+```bash
+python3 mean_levels_live.py
+```
+
+Live mode — places real orders via Public.com API:
+```bash
+python3 mean_levels_live.py --live
+```
+
+Specific tickers:
+```bash
+python3 mean_levels_live.py --live --tickers SPY QQQ AAPL NVDA
+```
+
+Override risk and max orders:
+```bash
+python3 mean_levels_live.py --live --risk-pct 1.5 --max-orders 4
+```
+
+JSON output:
+```bash
+python3 mean_levels_live.py --json
+```
+
+---
+
+### Scanner (Standalone)
+
+Scan default universe:
 ```bash
 python3 mean_levels_scanner.py
 ```
@@ -224,21 +264,6 @@ python3 mean_levels_scanner.py
 Scan specific tickers:
 ```bash
 python3 mean_levels_scanner.py --tickers AAPL MSFT NVDA
-```
-
-Use a tighter confluence band (0.3 %):
-```bash
-python3 mean_levels_scanner.py --tickers AAPL --confluence-pct 0.003
-```
-
-Machine-readable JSON output:
-```bash
-python3 mean_levels_scanner.py --json > scan.json
-```
-
-Custom output file:
-```bash
-python3 mean_levels_scanner.py --output my_scan.json
 ```
 
 ---
@@ -250,131 +275,49 @@ Print ranked universe (default top 30):
 python3 mean_levels_universe.py
 ```
 
-Select top 40 names:
-```bash
-python3 mean_levels_universe.py --top 40
-```
-
-High-volatility filter (ATR ≥ $2):
-```bash
-python3 mean_levels_universe.py --min-atr 2.0
-```
-
-High-volume filter (avg volume ≥ 2M shares):
-```bash
-python3 mean_levels_universe.py --min-vol 2000000
-```
-
-Run universe selection then immediately pipe to scanner:
+Select and immediately scan:
 ```bash
 python3 mean_levels_universe.py --run-scanner
 ```
 
 ---
 
-### Backtester
+### Backtester (v3)
 
-Run default backtest (12 months, $100K, 1 % risk, breaks-only):
+Run v3 backtest with DSS+Lyap gate:
 ```bash
-python3 mean_levels_backtest.py
+python3 mean_levels_backtest_v3.py
 ```
 
-Custom tickers, 24 months, $50K equity:
+Custom parameters:
 ```bash
-python3 mean_levels_backtest.py --tickers NVDA META TSLA --months 24 --equity 50000
-```
-
-V2 configuration (breaks-only, 2 % risk):
-```bash
-python3 mean_levels_backtest.py --breaks-only --risk-pct 0.02
-```
-
-All setups (breaks + bounces), 1 % risk:
-```bash
-python3 mean_levels_backtest.py --all-setups --risk-pct 0.01
-```
-
-High-quality zones only (score ≥ 7):
-```bash
-python3 mean_levels_backtest.py --min-score 7
-```
-
-JSON summary only:
-```bash
-python3 mean_levels_backtest.py --json
-```
-
----
-
-### Executor
-
-**Step 1:** Run the scanner to generate signal file.
-```bash
-python3 mean_levels_scanner.py
-```
-
-**Step 2:** Run the executor.
-
-Dry run (default) — shows recommended orders, no state change:
-```bash
-python3 mean_levels_executor.py --dry-run
-```
-
-Live mode — records positions to state file:
-```bash
-python3 mean_levels_executor.py --live
-```
-
-Show account status and open positions:
-```bash
-python3 mean_levels_executor.py --status
-```
-
-Manually close a position at a specific price:
-```bash
-python3 mean_levels_executor.py --close AAPL 182.50
-```
-
-Custom risk parameters in dry-run:
-```bash
-python3 mean_levels_executor.py --risk-pct 0.01 --min-score 6 --dry-run
+python3 mean_levels_backtest_v3.py --tickers NVDA META TSLA --months 24 --equity 50000
 ```
 
 ---
 
 ## 9. Configuration Reference
 
-### Common flags (all scripts)
+### mean_levels_live.py
 
 | Flag | Default | Description |
 |---|---|---|
-| `--tickers` | 30 defaults | Space-separated ticker symbols |
-| `--confluence-pct` | `0.005` | Zone width as fraction of price |
-| `--json` | off | Machine-readable JSON output |
+| `--live` | off | Place real orders (default: dry run) |
+| `--tickers` | 20 defaults | Space-separated ticker symbols |
+| `--risk-pct` | `1.0` | Risk per trade as % of equity |
+| `--max-orders` | `3` | Max limit orders per ticker |
+| `--equity` | auto | Override account equity (auto-fetched) |
+| `--json` | off | Print JSON session log |
 
-### Backtest-specific
+### Indicator Parameters
 
-| Flag | Default | Description |
-|---|---|---|
-| `--months` | `12` | Months of history to backtest |
-| `--equity` | `100000` | Starting account equity |
-| `--risk-pct` | `0.01` | Risk per trade (fraction of equity) |
-| `--atr-stop-mult` | `1.0` | Stop distance in ATR multiples |
-| `--rr` | `2.0` | Reward-to-risk ratio for target |
-| `--breaks-only` | on | Only trade BREAK setups |
-| `--all-setups` | off | Enable BOUNCE setups too |
-| `--min-score` | `3` | Min confluence score to trade |
-| `--output-dir` | `backtest_results/` | Directory for output files |
-
-### Executor-specific
-
-| Flag | Default | Description |
-|---|---|---|
-| `--risk-pct` | `0.02` | 2 % risk per trade (v2 config) |
-| `--min-score` | `5` | Min zone score for live orders |
-| `--max-positions` | `3` | Max simultaneous open positions |
-| `--state-file` | `executor_state.json` | State persistence file |
-| `--scanner-file` | `mean_levels_results.json` | Scanner results to read |
+| Indicator | Parameter | Default | Description |
+|---|---|---|---|
+| DSS Bressert | stoch | 13 | Stochastic lookback period |
+| DSS Bressert | smooth | 8 | Double-smoothing period |
+| DSS Bressert | signal | 8 | Signal line period |
+| Lyapunov HP | filter | 7 | HP filter smoothing |
+| Lyapunov HP | L_Period | 525 | Lyapunov lookback period |
 
 ---
 
@@ -398,5 +341,6 @@ decisions.
 ---
 
 *Built with [yfinance](https://github.com/ranaroussi/yfinance),
-[pandas](https://pandas.pydata.org/), [numpy](https://numpy.org/), and
-[matplotlib](https://matplotlib.org/).*
+[pandas](https://pandas.pydata.org/), [numpy](https://numpy.org/),
+[matplotlib](https://matplotlib.org/), and
+[publicdotcom-py](https://pypi.org/project/publicdotcom-py/).*

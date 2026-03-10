@@ -1,33 +1,27 @@
+#!/usr/bin/env python3
 """
-mean_levels_universe.py
-=======================
-Dynamic Universe Selector for the Mean Levels Strategy
--------------------------------------------------------
-Ranks ~110 candidate equities by a composite score of:
+Mean Levels Universe Selector
+==============================
+Dynamically selects the best ~30 tickers for the Mean Levels S/R Scanner
+based on liquidity, volatility, and recent momentum.
 
-  score = short_term_volume_ratio * ATR * relative_strength
+Criteria:
+  1. Liquidity  — 20-day average dollar volume ≥ $100M/day
+  2. Movement   — 5-day ATR% (Average True Range / Price) ≥ 1.0%
+  3. Not parabolics — 5-day return between -15% and +15% (filters blow-off moves)
+  4. Price       — ≥ $5 (avoids penny stock noise)
 
-Then filters by:
-  - Minimum average daily volume  (default 1,000,000 shares)
-  - Minimum ATR                   (default $1.00)
+Sources from S&P 500 + Nasdaq-100 + popular high-volume names.
 
-And selects the top N names (default 30) to pass to the scanner.
+Usage:
+  python3 mean_levels_universe.py                  # Select top 30, print and save
+  python3 mean_levels_universe.py --top 40          # Select top 40
+  python3 mean_levels_universe.py --json            # JSON output
+  python3 mean_levels_universe.py --run-scanner     # Select universe, then run scanner
 
-Candidate pool
---------------
-  • S&P 500 heavyweights (mega-cap tech, financials, healthcare, energy)
-  • Nasdaq-100 high-beta names
-  • High-beta cyclicals (semiconductors, EV, biotech)
-  • Sector ETFs (SPY, QQQ, IWM, XLF, XLE, XLK, XLV, SMH, ARKK, GLD, SLV, USO)
-
-Usage
------
-  python3 mean_levels_universe.py               # print ranked universe
-  python3 mean_levels_universe.py --run-scanner  # select then pipe to scanner
-  python3 mean_levels_universe.py --top 40       # select top 40 instead of 30
-  python3 mean_levels_universe.py --min-atr 2.0  # filter for high-vol names only
-  python3 mean_levels_universe.py --min-vol 2000000
-  python3 mean_levels_universe.py --json
+Output:
+  Saves the selected tickers to /home/user/workspace/mean_levels_watchlist.txt
+  (one ticker per line) for use by mean_levels_scanner.py
 """
 
 import argparse
@@ -35,327 +29,345 @@ import json
 import subprocess
 import sys
 from datetime import datetime
-from typing import Any
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
+# ---------------------------------------------------------------------------
+# Dependency bootstrap
+# ---------------------------------------------------------------------------
+
+def _ensure(package: str, import_name: str = None) -> None:
+    name = import_name or package
+    try:
+        __import__(name)
+    except ImportError:
+        print(f"[bootstrap] Installing {package} …")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", package, "--quiet"],
+            stdout=subprocess.DEVNULL,
+        )
+
+_ensure("yfinance")
+_ensure("pandas")
+
 import pandas as pd
 import yfinance as yf
 
 # ---------------------------------------------------------------------------
-# Candidate pool (~110 tickers)
+# ANSI colours
 # ---------------------------------------------------------------------------
-CANDIDATE_POOL: list[str] = [
-    # S&P 500 mega-cap tech
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA",
-    "AVGO", "ORCL", "CRM", "ADBE", "AMD", "QCOM", "TXN", "INTC",
-    "MU", "KLAC", "LRCX", "AMAT",
-    # Nasdaq-100 high-beta
-    "NFLX", "PANW", "CRWD", "SNOW", "DDOG", "TEAM", "ZS", "NET",
-    "MRVL", "SMCI", "ARM", "PLTR", "RBLX", "UBER", "LYFT", "ABNB",
-    "HOOD", "COIN", "MSTR", "SHOP",
+
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_CYAN   = "\033[96m"
+_BOLD   = "\033[1m"
+_RESET  = "\033[0m"
+
+def green(s):  return f"{_GREEN}{s}{_RESET}"
+def red(s):    return f"{_RED}{s}{_RESET}"
+def yellow(s): return f"{_YELLOW}{s}{_RESET}"
+def cyan(s):   return f"{_CYAN}{s}{_RESET}"
+def bold(s):   return f"{_BOLD}{s}{_RESET}"
+
+# ---------------------------------------------------------------------------
+# Ticker universe — broad pool to screen from
+# ---------------------------------------------------------------------------
+
+# S&P 500 mega/large caps + Nasdaq-100 heavyweights + popular high-beta names
+# ~120 names that cover the most-traded US equities
+CANDIDATE_POOL = [
+    # Broad market ETFs (always include)
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLI", "ARKK",
+    # Mega cap tech
+    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO", "NFLX", "CRM",
+    # Semiconductors
+    "AMD", "INTC", "MU", "MRVL", "QCOM", "ARM", "SMCI", "TSM", "AMAT", "LRCX",
+    # Software / Cloud
+    "PLTR", "SNOW", "DDOG", "CRWD", "NET", "PANW", "ZS", "SHOP", "UBER", "DASH",
     # Financials
-    "JPM", "BAC", "GS", "MS", "WFC", "C", "BLK", "SCHW", "V", "MA",
-    "PYPL", "SQ", "AXP",
-    # Healthcare / Biotech
-    "UNH", "LLY", "JNJ", "PFE", "ABBV", "MRK", "AMGN", "GILD",
-    "REGN", "BIIB", "MRNA",
+    "JPM", "GS", "MS", "BAC", "C", "WFC", "BLK", "SCHW", "COF", "AXP",
+    # Consumer / Retail
+    "COST", "WMT", "TGT", "HD", "LOW", "NKE", "SBUX", "MCD", "CMG", "LULU",
+    # Healthcare / Pharma
+    "UNH", "LLY", "JNJ", "PFE", "ABBV", "MRK", "BMY", "AMGN", "GILD", "ISRG",
     # Energy
-    "XOM", "CVX", "COP", "OXY", "SLB", "HAL",
-    # Consumer
-    "COST", "WMT", "TGT", "HD", "LOW", "NKE", "SBUX", "MCD",
+    "XOM", "CVX", "COP", "SLB", "OXY", "DVN", "MPC", "PSX", "VLO", "HAL",
     # Industrials / Aerospace
-    "CAT", "DE", "LMT", "RTX", "BA", "GE", "HON",
-    # China tech ADRs
-    "BABA", "JD", "BIDU", "NIO", "LI", "XPEV",
-    # ETFs
-    "SPY", "QQQ", "IWM", "DIA",
-    "XLF", "XLE", "XLK", "XLV", "XLC", "XLY", "XLI",
-    "SMH", "SOXX", "ARKK",
-    "GLD", "SLV", "USO", "TLT", "HYG",
+    "BA", "CAT", "DE", "GE", "HON", "LMT", "RTX", "UPS", "FDX", "MMM",
+    # Payment networks
+    "V", "MA", "PYPL",
+    # Crypto-adjacent / High-beta
+    "COIN", "MARA", "MSTR", "RIOT", "HOOD",
+    # Telecom / Media
+    "DIS", "CMCSA", "T", "VZ",
+    # Other popular large caps
+    "ORCL", "IBM", "ADBE", "NOW", "INTU", "TXN", "KO", "PEP", "PG", "ABT",
 ]
 
-# Deduplicate while preserving order
-_seen: set[str] = set()
-CANDIDATE_POOL = [t for t in CANDIDATE_POOL if not (t in _seen or _seen.add(t))]  # type: ignore[func-returns-value]
+# De-duplicate
+CANDIDATE_POOL = list(dict.fromkeys(CANDIDATE_POOL))
 
 # ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
-DEFAULT_TOP_N: int = 30
-DEFAULT_MIN_VOL: int = 1_000_000   # shares/day
-DEFAULT_MIN_ATR: float = 1.0       # dollars
-RS_BENCHMARK: str = "SPY"          # relative strength benchmark
-RS_PERIOD_DAYS: int = 20           # look-back for relative strength
-VOL_SHORT_DAYS: int = 5            # short-term volume ratio window
-
-
-# ---------------------------------------------------------------------------
-# Data helpers
+# Screening logic
 # ---------------------------------------------------------------------------
 
-def _download_batch(tickers: list[str], period: str = "3mo") -> pd.DataFrame:
-    """Bulk-download daily Close prices for multiple tickers."""
+def screen_universe(
+    candidates: List[str],
+    top_n: int = 30,
+    min_avg_dollar_vol: float = 100_000_000,   # $100M/day
+    min_atr_pct: float = 1.0,                   # 1.0% daily ATR
+    max_5d_return_abs: float = 15.0,            # filter parabolics
+    min_price: float = 5.0,
+    quiet: bool = False,
+) -> List[Dict]:
+    """
+    Screen candidates and return the top_n ranked by a composite score
+    of liquidity + movement.
+
+    Composite score = log(avg_dollar_volume) * atr_pct
+    This favours stocks that are BOTH liquid AND moving.
+    """
+    import math
+
+    if not quiet:
+        print(cyan(f"\nScreening {len(candidates)} candidates …"))
+
+    # Download 25 days of data in one batch for speed
     try:
         raw = yf.download(
-            tickers, period=period, interval="1d",
-            auto_adjust=True, progress=False, group_by="ticker",
+            candidates,
+            period="25d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
         )
     except Exception as exc:
-        raise RuntimeError(f"Batch download failed: {exc}") from exc
-    return raw
+        print(red(f"ERROR downloading data: {exc}"))
+        return []
 
+    results = []
 
-def compute_atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Return a per-ticker ATR Series from a multi-ticker OHLCV DataFrame."""
-    atrs: dict[str, float] = {}
-    if isinstance(df.columns, pd.MultiIndex):
-        tickers_in_df = df.columns.get_level_values(0).unique().tolist()
-        for tkr in tickers_in_df:
-            try:
-                sub = df[tkr][["High", "Low", "Close"]].dropna()
-                if len(sub) < period + 1:
-                    continue
-                hi, lo, cl = sub["High"], sub["Low"], sub["Close"].shift(1)
-                tr = pd.concat([(hi - lo), (hi - cl).abs(), (lo - cl).abs()], axis=1).max(axis=1)
-                atrs[tkr] = float(tr.rolling(period).mean().iloc[-1])
-            except Exception:
-                pass
-    return pd.Series(atrs)
-
-
-# ---------------------------------------------------------------------------
-# Scoring logic
-# ---------------------------------------------------------------------------
-
-def rank_universe(
-    min_vol: int = DEFAULT_MIN_VOL,
-    min_atr: float = DEFAULT_MIN_ATR,
-    top_n: int = DEFAULT_TOP_N,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Download data and rank candidate tickers by composite score.
-
-    Returns a DataFrame with columns:
-      ticker, price, atr, avg_vol, vol_ratio, rs_20d, composite_score, rank
-    """
-    if verbose:
-        print(f"Downloading data for {len(CANDIDATE_POOL)} candidates ...", flush=True)
-
-    # We need individual downloads for accurate OHLCV
-    rows: list[dict[str, Any]] = []
-
-    for i, ticker in enumerate(CANDIDATE_POOL, 1):
+    for ticker in candidates:
         try:
-            df = yf.download(
-                ticker, period="3mo", interval="1d",
-                auto_adjust=True, progress=False,
-            )
-            if df.empty:
-                continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            # Extract this ticker's data from the multi-ticker download
+            if len(candidates) == 1:
+                df = raw.copy()
+            else:
+                df = raw[ticker].copy()
 
-            if len(df) < 20:
+            df.dropna(subset=["Close", "Volume", "High", "Low"], inplace=True)
+
+            if len(df) < 10:
                 continue
 
+            # Current price
             price = float(df["Close"].iloc[-1])
+            if price < min_price:
+                continue
 
-            # ATR
-            hi, lo, cl = df["High"], df["Low"], df["Close"].shift(1)
-            tr = pd.concat([(hi - lo), (hi - cl).abs(), (lo - cl).abs()], axis=1).max(axis=1)
-            atr = float(tr.rolling(14).mean().iloc[-1])
+            # 20-day average dollar volume
+            recent_20 = df.iloc[-20:] if len(df) >= 20 else df
+            avg_volume = float(recent_20["Volume"].mean())
+            avg_dollar_vol = avg_volume * price
 
-            # Volume stats
-            avg_vol = float(df["Volume"].tail(20).mean())
-            short_vol = float(df["Volume"].tail(VOL_SHORT_DAYS).mean())
-            vol_ratio = short_vol / avg_vol if avg_vol > 0 else 0.0
+            if avg_dollar_vol < min_avg_dollar_vol:
+                continue
 
-            # Relative strength vs SPY (price % change)
-            ret_ticker = (
-                (df["Close"].iloc[-1] - df["Close"].iloc[-RS_PERIOD_DAYS - 1])
-                / df["Close"].iloc[-RS_PERIOD_DAYS - 1]
-            )
+            # 5-day ATR%  (Average True Range as % of price)
+            recent_5 = df.iloc[-5:]
+            tr_values = []
+            for i in range(len(recent_5)):
+                h = float(recent_5["High"].iloc[i])
+                l = float(recent_5["Low"].iloc[i])
+                if i == 0 and len(df) > 5:
+                    prev_c = float(df["Close"].iloc[-6])
+                elif i > 0:
+                    prev_c = float(recent_5["Close"].iloc[i - 1])
+                else:
+                    prev_c = float(recent_5["Close"].iloc[i])
+                tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+                tr_values.append(tr)
 
-            rows.append({
-                "ticker": ticker,
-                "price": round(price, 2),
-                "atr": round(atr, 3),
-                "avg_vol": int(avg_vol),
-                "vol_ratio": round(vol_ratio, 4),
-                "ret_20d": round(float(ret_ticker), 6),
+            atr = sum(tr_values) / len(tr_values)
+            atr_pct = (atr / price) * 100
+
+            if atr_pct < min_atr_pct:
+                continue
+
+            # 5-day return (filter parabolics)
+            close_5d_ago = float(df["Close"].iloc[-6]) if len(df) >= 6 else float(df["Close"].iloc[0])
+            return_5d = ((price - close_5d_ago) / close_5d_ago) * 100
+
+            if abs(return_5d) > max_5d_return_abs:
+                continue
+
+            # Composite score: liquidity × movement
+            # log(dollar_vol) weights liquidity on a compressed scale
+            # atr_pct weights how much the stock is actually moving
+            composite = math.log10(avg_dollar_vol) * atr_pct
+
+            results.append({
+                "ticker":         ticker,
+                "price":          round(price, 2),
+                "avg_dollar_vol": round(avg_dollar_vol),
+                "avg_dollar_vol_str": f"${avg_dollar_vol / 1e9:.1f}B" if avg_dollar_vol >= 1e9 else f"${avg_dollar_vol / 1e6:.0f}M",
+                "avg_volume":     round(avg_volume),
+                "atr_pct":        round(atr_pct, 2),
+                "return_5d":      round(return_5d, 2),
+                "composite":      round(composite, 2),
             })
 
-            if verbose and i % 20 == 0:
-                print(f"  Processed {i}/{len(CANDIDATE_POOL)} ...", flush=True)
-
         except Exception:
-            pass  # Skip silently
+            continue
 
-    df_ranks = pd.DataFrame(rows)
-    if df_ranks.empty:
-        raise RuntimeError("No data could be downloaded from the candidate pool.")
+    # Sort by composite score (highest = most liquid + most movement)
+    results.sort(key=lambda x: x["composite"], reverse=True)
 
-    # --- Fetch SPY return for relative strength ---
-    try:
-        spy = yf.download(RS_BENCHMARK, period="3mo", interval="1d",
-                          auto_adjust=True, progress=False)
-        if isinstance(spy.columns, pd.MultiIndex):
-            spy.columns = spy.columns.get_level_values(0)
-        spy_ret = float(
-            (spy["Close"].iloc[-1] - spy["Close"].iloc[-RS_PERIOD_DAYS - 1])
-            / spy["Close"].iloc[-RS_PERIOD_DAYS - 1]
-        )
-    except Exception:
-        spy_ret = 0.0
+    if not quiet:
+        print(f"  {len(results)} passed filters out of {len(candidates)}")
 
-    df_ranks["rs_20d"] = df_ranks["ret_20d"] - spy_ret
-
-    # --- Apply filters ---
-    df_ranks = df_ranks[df_ranks["avg_vol"] >= min_vol].copy()
-    df_ranks = df_ranks[df_ranks["atr"] >= min_atr].copy()
-
-    if df_ranks.empty:
-        raise RuntimeError(
-            f"No tickers passed filters: min_vol={min_vol}, min_atr={min_atr}"
-        )
-
-    # --- Normalise components to [0, 1] ---
-    def norm(s: pd.Series) -> pd.Series:
-        rng = s.max() - s.min()
-        return (s - s.min()) / rng if rng > 0 else s * 0.0
-
-    df_ranks["norm_vol_ratio"] = norm(df_ranks["vol_ratio"])
-    df_ranks["norm_atr"] = norm(df_ranks["atr"])
-    df_ranks["norm_rs"] = norm(df_ranks["rs_20d"])
-
-    # Composite score (equal-weight of the three normalised components)
-    df_ranks["composite_score"] = (
-        df_ranks["norm_vol_ratio"]
-        + df_ranks["norm_atr"]
-        + df_ranks["norm_rs"]
-    ) / 3.0
-
-    df_ranks.sort_values("composite_score", ascending=False, inplace=True)
-    df_ranks.reset_index(drop=True, inplace=True)
-    df_ranks["rank"] = df_ranks.index + 1
-
-    return df_ranks.head(top_n)
+    return results[:top_n]
 
 
 # ---------------------------------------------------------------------------
-# Output helpers
+# Output
 # ---------------------------------------------------------------------------
 
-def print_ranked_table(df: pd.DataFrame) -> None:
-    """Pretty-print the ranked universe table."""
-    sep = "=" * 90
-    print(f"\n{sep}")
-    print("  MEAN LEVELS UNIVERSE SELECTOR – RANKED RESULTS")
-    print(sep)
-    print(f"  {'#':>3}  {'TICKER':<7}  {'PRICE':>8}  {'ATR':>6}  "
-          f"{'AVG VOL':>12}  {'VOL RATIO':>9}  {'RS 20D':>8}  {'SCORE':>7}")
-    print("-" * 90)
-    for _, row in df.iterrows():
-        vol_m = row["avg_vol"] / 1_000_000
+WATCHLIST_PATH = "/home/user/workspace/mean_levels_watchlist.txt"
+UNIVERSE_JSON  = "/home/user/workspace/mean_levels_universe.json"
+
+
+def print_results(selected: List[Dict]) -> None:
+    print()
+    print(bold("=" * 95))
+    print(bold("  MEAN LEVELS UNIVERSE — TOP PICKS"))
+    print(bold("  " + datetime.now().strftime("%Y-%m-%d %H:%M:%S ET")))
+    print(bold("=" * 95))
+    print()
+    print(bold(
+        f"{'#':>3}  {'TICKER':<7}  {'PRICE':>9}  {'AVG $ VOL':>10}  "
+        f"{'ATR%':>6}  {'5D RET%':>8}  {'SCORE':>7}  {'WHY'}"
+    ))
+    print("-" * 95)
+
+    for i, r in enumerate(selected, 1):
+        # Tag the reason
+        tags = []
+        if r["atr_pct"] >= 3.0:
+            tags.append("HIGH VOL")
+        elif r["atr_pct"] >= 2.0:
+            tags.append("VOLATILE")
+        if r["avg_dollar_vol"] >= 5e9:
+            tags.append("MEGA LIQ")
+        elif r["avg_dollar_vol"] >= 1e9:
+            tags.append("HIGH LIQ")
+        if abs(r["return_5d"]) >= 5:
+            tags.append("BIG MOVE")
+
+        tag_str = ", ".join(tags) if tags else "SOLID"
+
+        colour = green if r["return_5d"] >= 0 else red
+        ret_str = colour(f"{r['return_5d']:>+7.2f}%")
+
         print(
-            f"  {row['rank']:>3}  {row['ticker']:<7}  {row['price']:>8.2f}  "
-            f"{row['atr']:>6.2f}  {vol_m:>10.1f}M  {row['vol_ratio']:>9.3f}  "
-            f"{row['rs_20d']:>8.4f}  {row['composite_score']:>7.4f}"
+            f"{i:>3}  {r['ticker']:<7}  "
+            f"${r['price']:>8.2f}  "
+            f"{r['avg_dollar_vol_str']:>10}  "
+            f"{r['atr_pct']:>5.2f}%  "
+            f"{ret_str}  "
+            f"{r['composite']:>7.2f}  "
+            f"{tag_str}"
         )
-    print(sep)
-    print(f"\n  Selected {len(df)} tickers\n")
+
+    print()
+
+
+def save_watchlist(selected: List[Dict], path: str = WATCHLIST_PATH) -> None:
+    tickers = [r["ticker"] for r in selected]
+    with open(path, "w") as f:
+        f.write("\n".join(tickers) + "\n")
+    print(f"Watchlist saved → {path} ({len(tickers)} tickers)")
+
+
+def save_json(selected: List[Dict], path: str = UNIVERSE_JSON) -> None:
+    payload = {
+        "scan_time": datetime.now().isoformat(),
+        "count": len(selected),
+        "tickers": selected,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def main():
     parser = argparse.ArgumentParser(
-        description="Mean Levels Universe Selector – pick best tickers to scan",
+        description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
     )
     parser.add_argument(
-        "--top", type=int, default=DEFAULT_TOP_N, metavar="N",
-        help=f"Number of tickers to select (default {DEFAULT_TOP_N})",
+        "--top", type=int, default=30,
+        help="Number of tickers to select (default: 30)",
     )
     parser.add_argument(
-        "--min-vol", type=int, default=DEFAULT_MIN_VOL, metavar="SHARES",
-        help=f"Minimum avg daily volume filter (default {DEFAULT_MIN_VOL:,})",
+        "--min-dollar-vol", type=float, default=100_000_000,
+        help="Minimum 20-day avg dollar volume (default: $100M)",
     )
     parser.add_argument(
-        "--min-atr", type=float, default=DEFAULT_MIN_ATR, metavar="DOLLARS",
-        help=f"Minimum ATR filter in dollars (default {DEFAULT_MIN_ATR})",
-    )
-    parser.add_argument(
-        "--run-scanner", action="store_true",
-        help="After selection, pipe chosen tickers into mean_levels_scanner.py",
-    )
-    parser.add_argument(
-        "--output", default="universe_selected.json", metavar="FILE",
-        help="Output JSON file path (default: universe_selected.json)",
+        "--min-atr", type=float, default=1.0,
+        help="Minimum 5-day ATR%% (default: 1.0%%)",
     )
     parser.add_argument(
         "--json", action="store_true",
-        help="Suppress progress output; print compact JSON to stdout",
+        help="Print JSON output instead of table",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--run-scanner", action="store_true",
+        help="After selecting universe, immediately run mean_levels_scanner.py with the result",
+    )
+    parser.add_argument(
+        "--equity", type=float, default=None,
+        help="Account equity to pass to the scanner (only used with --run-scanner)",
+    )
 
+    args = parser.parse_args()
 
-def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
-    verbose = not args.json
-
-    if verbose:
-        print(f"Mean Levels Universe Selector  |  "
-              f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-        print(f"Candidates: {len(CANDIDATE_POOL)}  |  "
-              f"Target top: {args.top}  |  "
-              f"Min vol: {args.min_vol:,}  |  "
-              f"Min ATR: ${args.min_atr:.2f}\n")
-
-    ranked = rank_universe(
-        min_vol=args.min_vol,
-        min_atr=args.min_atr,
+    selected = screen_universe(
+        candidates=CANDIDATE_POOL,
         top_n=args.top,
-        verbose=verbose,
+        min_avg_dollar_vol=args.min_dollar_vol,
+        min_atr_pct=args.min_atr,
+        quiet=args.json,
     )
 
-    selected_tickers = ranked["ticker"].tolist()
-
-    output_payload = {
-        "selection_time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "top_n": args.top,
-        "min_vol": args.min_vol,
-        "min_atr": args.min_atr,
-        "candidate_count": len(CANDIDATE_POOL),
-        "selected_count": len(selected_tickers),
-        "tickers": selected_tickers,
-        "ranked_data": ranked.to_dict(orient="records"),
-    }
+    if not selected:
+        print(yellow("No tickers passed the screening filters."))
+        return
 
     if args.json:
-        print(json.dumps(output_payload, separators=(",", ":")))
+        print(json.dumps({"scan_time": datetime.now().isoformat(), "tickers": selected}, indent=2))
     else:
-        print_ranked_table(ranked)
+        print_results(selected)
 
-    with open(args.output, "w") as fh:
-        json.dump(output_payload, fh, indent=2)
+    save_watchlist(selected)
+    save_json(selected)
 
-    if verbose:
-        print(f"Universe saved to {args.output}")
-        print(f"Selected: {' '.join(selected_tickers)}\n")
-
+    # Optionally chain into the scanner
     if args.run_scanner:
-        if verbose:
-            print("Launching mean_levels_scanner.py with selected universe ...\n")
+        tickers = [r["ticker"] for r in selected]
         cmd = [
-            sys.executable, "mean_levels_scanner.py",
-            "--tickers", *selected_tickers,
+            sys.executable, "/home/user/workspace/mean_levels_scanner.py",
+            "--tickers", *tickers,
         ]
-        subprocess.run(cmd, check=True)
+        if args.equity:
+            cmd.extend(["--equity", str(args.equity)])
+        print(bold(f"\n>>> Running scanner on {len(tickers)} tickers …\n"))
+        subprocess.run(cmd)
 
 
 if __name__ == "__main__":

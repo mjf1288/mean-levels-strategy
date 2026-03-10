@@ -37,6 +37,8 @@ Thumbs.db
 executor_state.json
 executor_state.json.tmp
 mean_levels_results.json
+mean_levels_live_log.json
+mean_levels_execution_log.json
 universe_selected.json
 
 # ── Backtest outputs ───────────────────────────────────────────────────────────

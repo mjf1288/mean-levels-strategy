@@ -1,576 +1,553 @@
+#!/usr/bin/env python3
 """
-mean_levels_executor.py
-=======================
-Live / Paper Trade Executor for the Mean Levels Strategy
----------------------------------------------------------
-Reads scanner output from mean_levels_results.json and converts active setups
-into actionable order recommendations with full position sizing, stops, and
-targets.  State is persisted to executor_state.json so it survives restarts.
+Mean Levels Live Executor
+=========================
+Reads scanner results and places live trades via Public.com API.
 
-Risk Management Defaults (v2 config – breaks-only, optimised)
---------------------------------------------------------------
-  Risk per trade   : 2 % of current equity
-  Stop-loss        : 1 × ATR below/above entry
-  Take-profit      : 2 × risk (R:R = 1:2)
-  Setup filter     : BREAK setups only
-  Min zone score   : 5
-  Max open positions: 3
+Design:
+  - BREAKS ONLY (BREAK_LONG / BREAK_SELL) — bounces filtered per backtest v2
+  - 1% risk per trade (configurable via --risk-pct)
+  - Limit entry at zone center (retest of broken level)
+  - Separate stop-loss order (STOP) placed after entry fills or immediately as GTC
+  - Score >= 3 required; score 3 gets half-size, score >= 4 gets full size
+  - Max concurrent positions capped to prevent overconcentration
+  - Dry-run by default; pass --live to place real orders
 
-Modes
------
-  --dry-run  (default)  Print recommendations without recording state changes.
-  --live                Apply recommendations to live state (persist positions).
-  --status              Show current open positions and daily P&L.
-
-State File (executor_state.json)
----------------------------------
-  Stores: open positions, closed trades log, running equity, daily stats.
-  Created automatically on first run; never contains API keys or secrets.
-
-Usage
------
-  python3 mean_levels_executor.py --dry-run
-  python3 mean_levels_executor.py --live
-  python3 mean_levels_executor.py --status
-  python3 mean_levels_executor.py --close AAPL 182.50
-  python3 mean_levels_executor.py --risk-pct 0.01 --min-score 6 --dry-run
+Usage:
+  python3 mean_levels_executor.py                    # Dry-run (default)
+  python3 mean_levels_executor.py --live             # Place real orders
+  python3 mean_levels_executor.py --risk-pct 2.0     # 2% risk per trade
+  python3 mean_levels_executor.py --min-score 5      # Only high-conviction
+  python3 mean_levels_executor.py --max-positions 5  # Cap at 5 orders
 """
 
 import argparse
 import json
 import os
+import subprocess
 import sys
-from datetime import datetime, date
-from typing import Any
-
-import numpy as np
-import pandas as pd
-import yfinance as yf
+import uuid
+from datetime import datetime
+from decimal import Decimal
+from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Constants / defaults
-# ---------------------------------------------------------------------------
-DEFAULT_SCANNER_OUTPUT: str = "mean_levels_results.json"
-DEFAULT_STATE_FILE: str = "executor_state.json"
-DEFAULT_EQUITY: float = 100_000.0
-DEFAULT_RISK_PCT: float = 0.02          # 2 % of equity
-DEFAULT_ATR_STOP_MULT: float = 1.0
-DEFAULT_RR: float = 2.0
-DEFAULT_MIN_SCORE: int = 5
-DEFAULT_MAX_POSITIONS: int = 3
-BREAKS_ONLY: bool = True               # default to break setups only
-
-
-# ---------------------------------------------------------------------------
-# State management
+# Dependency bootstrap
 # ---------------------------------------------------------------------------
 
-def _empty_state(equity: float) -> dict[str, Any]:
-    return {
-        "created": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "last_updated": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "equity": equity,
-        "initial_equity": equity,
-        "open_positions": {},   # ticker → position dict
-        "closed_trades": [],
-        "daily_stats": {},      # date str → {pnl, trades}
-        "session_count": 0,
-    }
-
-
-def load_state(state_file: str, initial_equity: float) -> dict[str, Any]:
-    """Load state from disk or create a fresh state."""
-    if os.path.exists(state_file):
-        try:
-            with open(state_file) as fh:
-                return json.load(fh)
-        except (json.JSONDecodeError, OSError) as exc:
-            print(f"[WARN] Could not load state ({exc}); starting fresh.")
-    return _empty_state(initial_equity)
-
-
-def save_state(state: dict[str, Any], state_file: str) -> None:
-    """Persist state to disk (atomic write via temp file)."""
-    state["last_updated"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    tmp = state_file + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(state, fh, indent=2)
-    os.replace(tmp, state_file)
-
-
-# ---------------------------------------------------------------------------
-# Fetching current price & ATR
-# ---------------------------------------------------------------------------
-
-def get_current_price_and_atr(ticker: str) -> tuple[float, float]:
-    """Return (latest_close, 14-bar ATR) for *ticker*."""
+def _ensure(package: str, import_name: str = None) -> None:
+    name = import_name or package
     try:
-        df = yf.download(ticker, period="1mo", interval="1d",
-                         auto_adjust=True, progress=False)
-        if df.empty:
-            raise ValueError(f"No data for {ticker}")
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df[["Open", "High", "Low", "Close"]].dropna()
-        price = float(df["Close"].iloc[-1])
-        hi, lo, cl = df["High"], df["Low"], df["Close"].shift(1)
-        tr = pd.concat([(hi - lo), (hi - cl).abs(), (lo - cl).abs()], axis=1).max(axis=1)
-        atr = float(tr.rolling(14).mean().iloc[-1])
-        return price, atr
-    except Exception as exc:
-        raise RuntimeError(f"Could not fetch {ticker}: {exc}") from exc
-
-
-# ---------------------------------------------------------------------------
-# Order generation
-# ---------------------------------------------------------------------------
-
-def generate_order(
-    ticker: str,
-    setup_type: str,
-    price: float,
-    atr: float,
-    equity: float,
-    risk_pct: float,
-    atr_stop_mult: float,
-    rr: float,
-) -> dict[str, Any]:
-    """Build an order recommendation dict from a setup signal.
-
-    Parameters
-    ----------
-    ticker : str
-    setup_type : str  – 'BREAK_LONG', 'BREAK_SHORT', etc.
-    price : float     – current market price (entry estimate)
-    atr : float       – 14-bar ATR
-    equity : float    – current account equity
-    risk_pct : float  – fraction of equity to risk
-    atr_stop_mult : float
-    rr : float        – reward-to-risk ratio
-
-    Returns
-    -------
-    Order dict with entry, stop, target, shares, risk_dollars.
-    """
-    direction = "LONG" if "LONG" in setup_type else "SHORT"
-    risk_per_share = atr_stop_mult * atr
-    risk_dollars = equity * risk_pct
-    shares = risk_dollars / risk_per_share if risk_per_share > 0 else 0.0
-
-    if direction == "LONG":
-        stop = price - risk_per_share
-        target = price + rr * risk_per_share
-    else:
-        stop = price + risk_per_share
-        target = price - rr * risk_per_share
-
-    return {
-        "ticker": ticker,
-        "direction": direction,
-        "setup_type": setup_type,
-        "entry_price": round(price, 4),
-        "stop": round(stop, 4),
-        "target": round(target, 4),
-        "shares": round(shares, 2),
-        "risk_dollars": round(risk_dollars, 2),
-        "risk_pct": round(risk_pct * 100, 2),
-        "atr": round(atr, 4),
-        "rr": rr,
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Scanner result processing
-# ---------------------------------------------------------------------------
-
-def load_scanner_results(scanner_file: str) -> list[dict[str, Any]]:
-    """Load and return the per-ticker results from a scanner JSON file."""
-    if not os.path.exists(scanner_file):
-        raise FileNotFoundError(
-            f"Scanner output not found: {scanner_file}\n"
-            "Run mean_levels_scanner.py first."
+        __import__(name)
+    except ImportError:
+        print(f"[bootstrap] Installing {package} …")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", package, "--quiet"],
+            stdout=subprocess.DEVNULL,
         )
-    with open(scanner_file) as fh:
-        data = json.load(fh)
-    return data.get("results", [])
 
+_ensure("publicdotcom-py", "public_api_sdk")
 
-def filter_signals(
-    results: list[dict[str, Any]],
-    breaks_only: bool,
-    min_score: int,
-    already_open: set[str],
-    max_positions: int,
-    current_open: int,
-) -> list[dict[str, Any]]:
-    """Filter scanner results down to actionable signals.
-
-    Parameters
-    ----------
-    results : list
-        Per-ticker scan results from scanner.
-    breaks_only : bool
-        If True, only BREAK_LONG and BREAK_SHORT setups pass.
-    min_score : int
-        Minimum zone confluence score.
-    already_open : set[str]
-        Tickers that already have an open position (skip them).
-    max_positions : int
-        Maximum total open positions allowed.
-    current_open : int
-        Number of positions currently open.
-
-    Returns
-    -------
-    Filtered list of (result, setup) tuples as dicts.
-    """
-    signals: list[dict[str, Any]] = []
-    slots_remaining = max_positions - current_open
-
-    for result in results:
-        if result.get("error"):
-            continue
-        ticker = result["ticker"]
-        if ticker in already_open:
-            continue
-
-        for setup in result.get("setups", []):
-            stype = setup["type"]
-            if breaks_only and "BREAK" not in stype:
-                continue
-            if setup["zone_score"] < min_score:
-                continue
-
-            signals.append({
-                "ticker": ticker,
-                "price": result["price"],
-                "atr": result.get("atr"),
-                "setup": setup,
-                "levels": result.get("levels", {}),
-                "scan_time": result.get("scan_time"),
-            })
-            break  # one signal per ticker
-
-        if len(signals) >= slots_remaining:
-            break
-
-    return signals
-
+from public_api_sdk import (
+    PublicApiClient,
+    PublicApiClientConfiguration,
+    OrderRequest,
+    PreflightRequest,
+    OrderInstrument,
+    InstrumentType,
+    OrderSide,
+    OrderType,
+    OrderExpirationRequest,
+    TimeInForce,
+)
+from public_api_sdk.auth_config import ApiKeyAuthConfig
 
 # ---------------------------------------------------------------------------
-# Position management
+# Constants
 # ---------------------------------------------------------------------------
 
-def open_position(
-    state: dict[str, Any],
-    order: dict[str, Any],
-) -> None:
-    """Record a new open position in state (--live mode)."""
-    ticker = order["ticker"]
-    state["open_positions"][ticker] = {
-        **order,
-        "open_date": date.today().isoformat(),
-        "status": "OPEN",
-    }
+RESULTS_PATH = "/home/user/workspace/mean_levels_results.json"
+EXECUTION_LOG_PATH = "/home/user/workspace/mean_levels_execution_log.json"
+ACCOUNT_ID = "5OF28683"
 
+# ANSI
+_GREEN = "\033[92m"
+_RED = "\033[91m"
+_YELLOW = "\033[93m"
+_CYAN = "\033[96m"
+_BOLD = "\033[1m"
+_RESET = "\033[0m"
 
-def close_position(
-    state: dict[str, Any],
-    ticker: str,
-    exit_price: float,
-) -> dict[str, Any] | None:
-    """Close a position manually and record the trade."""
-    pos = state["open_positions"].pop(ticker, None)
-    if pos is None:
-        return None
-
-    direction = pos["direction"]
-    entry = pos["entry_price"]
-    shares = pos["shares"]
-
-    raw_pnl = (exit_price - entry) * shares
-    pnl = raw_pnl if direction == "LONG" else -raw_pnl
-
-    state["equity"] += pnl
-
-    trade = {
-        **pos,
-        "exit_price": round(exit_price, 4),
-        "pnl": round(pnl, 2),
-        "exit_date": date.today().isoformat(),
-        "exit_reason": "MANUAL",
-        "win": pnl > 0,
-        "equity_after": round(state["equity"], 2),
-    }
-    state["closed_trades"].append(trade)
-    return trade
-
+def green(s): return f"{_GREEN}{s}{_RESET}"
+def red(s): return f"{_RED}{s}{_RESET}"
+def yellow(s): return f"{_YELLOW}{s}{_RESET}"
+def cyan(s): return f"{_CYAN}{s}{_RESET}"
+def bold(s): return f"{_BOLD}{s}{_RESET}"
 
 # ---------------------------------------------------------------------------
-# Display helpers
+# Load scanner results
 # ---------------------------------------------------------------------------
 
-SEP = "=" * 72
-
-
-def print_status(state: dict[str, Any]) -> None:
-    """Print current account status."""
-    print(f"\n{SEP}")
-    print("  MEAN LEVELS EXECUTOR – STATUS")
-    print(SEP)
-    equity = state["equity"]
-    initial = state["initial_equity"]
-    net_pnl = equity - initial
-    ret_pct = net_pnl / initial * 100
-
-    print(f"  Equity  : ${equity:>12,.2f}")
-    print(f"  Initial : ${initial:>12,.2f}")
-    print(f"  Net P&L : ${net_pnl:>+12,.2f}  ({ret_pct:+.2f}%)")
-    print(f"  Sessions: {state['session_count']}")
-    print(f"  Updated : {state['last_updated']}")
-
-    open_pos = state["open_positions"]
-    print(f"\n  OPEN POSITIONS ({len(open_pos)}):")
-    if open_pos:
-        print(f"  {'Ticker':<8} {'Dir':<6} {'Entry':>8} {'Stop':>8} "
-              f"{'Target':>8} {'Shares':>8} {'Risk $':>8}")
-        print("  " + "-" * 60)
-        for tkr, pos in open_pos.items():
-            print(f"  {tkr:<8} {pos['direction']:<6} "
-                  f"{pos['entry_price']:>8.2f} {pos['stop']:>8.2f} "
-                  f"{pos['target']:>8.2f} {pos['shares']:>8.1f} "
-                  f"${pos['risk_dollars']:>7.2f}")
-    else:
-        print("  (none)")
-
-    closed = state["closed_trades"]
-    print(f"\n  RECENT CLOSED TRADES (last 5 of {len(closed)}):")
-    if closed:
-        recent = closed[-5:]
-        for t in reversed(recent):
-            flag = "WIN " if t.get("win") else "LOSS"
-            print(f"  [{flag}] {t['ticker']:<6} {t['direction']:<5} "
-                  f"entry={t['entry_price']:.2f} exit={t['exit_price']:.2f} "
-                  f"P&L=${t['pnl']:+.2f}  {t['exit_date']}")
-    else:
-        print("  (none)")
-    print(SEP + "\n")
-
-
-def print_orders(
-    orders: list[dict[str, Any]],
-    dry_run: bool = True,
-) -> None:
-    """Print generated order recommendations."""
-    mode = "DRY RUN" if dry_run else "LIVE"
-    print(f"\n{SEP}")
-    print(f"  MEAN LEVELS EXECUTOR – ORDER RECOMMENDATIONS  [{mode}]")
-    print(SEP)
-
-    if not orders:
-        print("  No actionable signals found.\n")
-        print(SEP + "\n")
-        return
-
-    for i, order in enumerate(orders, 1):
-        direction_str = "▲ LONG " if order["direction"] == "LONG" else "▼ SHORT"
-        print(f"\n  [{i}] {order['ticker']}  {direction_str}  ({order['setup_type']})")
-        print(f"      Entry  : ${order['entry_price']:.2f}")
-        print(f"      Stop   : ${order['stop']:.2f}  "
-              f"(−{abs(order['entry_price']-order['stop']):.2f}, 1×ATR)")
-        print(f"      Target : ${order['target']:.2f}  "
-              f"(+{abs(order['target']-order['entry_price']):.2f}, {order['rr']}R)")
-        print(f"      Shares : {order['shares']:.1f}  "
-              f"Risk: ${order['risk_dollars']:.2f} ({order['risk_pct']:.1f}%)")
-
-    print(f"\n  Total signals: {len(orders)}")
-    print(SEP + "\n")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Mean Levels Live/Paper Trade Executor",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument(
-        "--dry-run", action="store_true", default=True,
-        help="Generate order recommendations without changing state (default)",
-    )
-    mode_group.add_argument(
-        "--live", action="store_true",
-        help="Apply recommendations and persist positions to state file",
-    )
-    mode_group.add_argument(
-        "--status", action="store_true",
-        help="Show current open positions and account stats",
-    )
-
-    parser.add_argument(
-        "--close", nargs=2, metavar=("TICKER", "PRICE"),
-        help="Manually close a position: --close AAPL 182.50",
-    )
-    parser.add_argument(
-        "--scanner-file", default=DEFAULT_SCANNER_OUTPUT, metavar="FILE",
-        help=f"Scanner output to read (default: {DEFAULT_SCANNER_OUTPUT})",
-    )
-    parser.add_argument(
-        "--state-file", default=DEFAULT_STATE_FILE, metavar="FILE",
-        help=f"State persistence file (default: {DEFAULT_STATE_FILE})",
-    )
-    parser.add_argument(
-        "--equity", type=float, default=DEFAULT_EQUITY, metavar="DOLLARS",
-        help=f"Initial equity when creating fresh state (default ${DEFAULT_EQUITY:,.0f})",
-    )
-    parser.add_argument(
-        "--risk-pct", type=float, default=DEFAULT_RISK_PCT, metavar="FRAC",
-        help=f"Risk per trade as fraction of equity (default {DEFAULT_RISK_PCT})",
-    )
-    parser.add_argument(
-        "--min-score", type=int, default=DEFAULT_MIN_SCORE, metavar="N",
-        help=f"Minimum confluence zone score (default {DEFAULT_MIN_SCORE})",
-    )
-    parser.add_argument(
-        "--max-positions", type=int, default=DEFAULT_MAX_POSITIONS, metavar="N",
-        help=f"Maximum concurrent open positions (default {DEFAULT_MAX_POSITIONS})",
-    )
-    parser.add_argument(
-        "--all-setups", action="store_true",
-        help="Include BOUNCE setups in addition to BREAKs",
-    )
-    parser.add_argument(
-        "--atr-stop-mult", type=float, default=DEFAULT_ATR_STOP_MULT, metavar="X",
-        help=f"ATR stop multiplier (default {DEFAULT_ATR_STOP_MULT})",
-    )
-    parser.add_argument(
-        "--rr", type=float, default=DEFAULT_RR, metavar="RATIO",
-        help=f"Reward-to-risk ratio (default {DEFAULT_RR})",
-    )
-    parser.add_argument(
-        "--json", action="store_true",
-        help="Output JSON instead of formatted table",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
-    live_mode = args.live
-    status_mode = args.status
-
-    state = load_state(args.state_file, args.equity)
-
-    # --- Manual close ---
-    if args.close:
-        ticker_arg, price_arg = args.close
-        try:
-            exit_p = float(price_arg)
-        except ValueError:
-            print(f"ERROR: Invalid price '{price_arg}'")
-            sys.exit(1)
-        trade = close_position(state, ticker_arg.upper(), exit_p)
-        if trade is None:
-            print(f"No open position found for {ticker_arg.upper()}")
-        else:
-            print(f"Closed {trade['ticker']}: P&L = ${trade['pnl']:+.2f}")
-            save_state(state, args.state_file)
-        return
-
-    # --- Status mode ---
-    if status_mode:
-        print_status(state)
-        return
-
-    # --- Load scanner results ---
-    try:
-        scan_results = load_scanner_results(args.scanner_file)
-    except FileNotFoundError as exc:
-        print(f"ERROR: {exc}")
+def load_scanner_results(path: str = RESULTS_PATH) -> List[Dict]:
+    """Load and return scanner results from JSON file."""
+    if not os.path.exists(path):
+        print(red(f"ERROR: Scanner results not found at {path}"))
+        print("Run the scanner first: python3 mean_levels_scanner.py")
         sys.exit(1)
 
-    scan_time = None
-    if os.path.exists(args.scanner_file):
-        with open(args.scanner_file) as fh:
-            raw = json.load(fh)
-            scan_time = raw.get("scan_time", "unknown")
+    with open(path) as f:
+        data = json.load(f)
 
-    print(f"\nMean Levels Executor  |  "
-          f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"Scanner data: {scan_time}  |  "
-          f"Equity: ${state['equity']:,.2f}")
+    results = data.get("results", [])
+    scan_time = data.get("scan_time", "unknown")
+    print(f"[info] Loaded scanner results from {scan_time}")
+    print(f"[info] {len(results)} tickers scanned")
+    return results
 
-    breaks_only = not args.all_setups
-    already_open = set(state["open_positions"].keys())
-    current_open = len(already_open)
 
-    signals = filter_signals(
-        results=scan_results,
-        breaks_only=breaks_only,
-        min_score=args.min_score,
-        already_open=already_open,
-        max_positions=args.max_positions,
-        current_open=current_open,
-    )
+# ---------------------------------------------------------------------------
+# Filter to break-only setups
+# ---------------------------------------------------------------------------
 
-    orders: list[dict[str, Any]] = []
+def filter_break_setups(
+    results: List[Dict],
+    min_score: int = 3,
+    long_only: bool = True,
+) -> List[Dict]:
+    """
+    Extract only BREAK_LONG (and optionally BREAK_SELL) setups with score >= min_score.
+    Returns a flat list of dicts with ticker info attached.
 
-    for sig in signals:
-        ticker = sig["ticker"]
-        price = sig.get("price")
-        atr = sig.get("atr")
+    long_only=True (default) filters out all SELL setups because Public.com
+    does not support short selling on equity accounts.
+    """
+    allowed_types = {"BREAK_LONG"}
+    if not long_only:
+        allowed_types.add("BREAK_SELL")
 
-        # Refresh live price/ATR if data is stale or missing
-        if price is None or atr is None:
-            try:
-                price, atr = get_current_price_and_atr(ticker)
-            except RuntimeError as exc:
-                print(f"  [WARN] Skipping {ticker}: {exc}")
+    setups = []
+    skipped_sells = 0
+    for r in results:
+        if r is None:
+            continue
+        ticker = r["ticker"]
+        price = r["price"]
+        for setup in r.get("setups", []):
+            setup_type = setup.get("type", "")
+            score = setup.get("score", 0)
+
+            # Filter: breaks only, min score
+            if setup_type not in ("BREAK_LONG", "BREAK_SELL"):
+                continue
+            if score < min_score:
+                continue
+            # Long-only filter
+            if setup_type not in allowed_types:
+                skipped_sells += 1
                 continue
 
-        order = generate_order(
-            ticker=ticker,
-            setup_type=sig["setup"]["type"],
-            price=price,
-            atr=atr,
-            equity=state["equity"],
-            risk_pct=args.risk_pct,
-            atr_stop_mult=args.atr_stop_mult,
-            rr=args.rr,
+            setups.append({
+                "ticker": ticker,
+                "price": price,
+                "type": setup_type,
+                "score": score,
+                "entry": setup["entry"],
+                "stop": setup["stop"],
+                "t1": setup["t1"],
+                "t2": setup["t2"],
+                "t3": setup["t3"],
+                "risk_per_share": setup["risk_per_share"],
+                "levels": "+".join(setup["zone"]["levels"]),
+            })
+
+    if skipped_sells > 0 and long_only:
+        print(f"[info] Skipped {skipped_sells} SELL setup(s) — long-only mode (Public.com)")
+
+    # Sort by score descending (best setups first)
+    setups.sort(key=lambda x: x["score"], reverse=True)
+    return setups
+
+
+# ---------------------------------------------------------------------------
+# Position sizing
+# ---------------------------------------------------------------------------
+
+def size_position(
+    equity: float,
+    entry: float,
+    stop: float,
+    risk_pct: float,
+    score: int,
+) -> Dict:
+    """
+    Calculate position size using fixed-fractional risk model.
+
+    Returns dict with: shares, risk_dollars, position_value
+    """
+    risk_per_share = abs(entry - stop)
+    if risk_per_share == 0:
+        return {"shares": 0, "risk_dollars": 0, "position_value": 0}
+
+    risk_dollars = equity * (risk_pct / 100.0)
+
+    # Half-size for score 3 (marginal confluence)
+    if score <= 3:
+        risk_dollars *= 0.5
+
+    shares = int(risk_dollars / risk_per_share)
+    if shares < 1:
+        shares = 1
+
+    position_value = round(shares * entry, 2)
+
+    return {
+        "shares": shares,
+        "risk_dollars": round(risk_dollars, 2),
+        "position_value": position_value,
+        "risk_per_share": round(risk_per_share, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fetch live equity from Public.com
+# ---------------------------------------------------------------------------
+
+def get_live_equity(secret: str) -> float:
+    """Fetch total equity from Public.com portfolio."""
+    try:
+        client = PublicApiClient(
+            ApiKeyAuthConfig(api_secret_key=secret),
+            config=PublicApiClientConfiguration(default_account_number=ACCOUNT_ID),
         )
-        order["zone_price"] = sig["setup"]["zone_price"]
-        order["zone_score"] = sig["setup"]["zone_score"]
-        order["zone_levels"] = sig["setup"]["zone_levels"]
-        orders.append(order)
+        portfolio = client.get_portfolio()
+        total_equity = sum(e.value for e in portfolio.equity)
+        client.close()
+        return float(total_equity)
+    except Exception as e:
+        print(yellow(f"[warn] Could not fetch live equity: {e}"))
+        print(yellow("[warn] Falling back to --equity override or default"))
+        return 0.0
 
-    if args.json:
-        payload = {
-            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "mode": "live" if live_mode else "dry_run",
-            "equity": state["equity"],
-            "open_positions": list(state["open_positions"].keys()),
-            "orders": orders,
-        }
-        print(json.dumps(payload, separators=(",", ":")))
+
+# ---------------------------------------------------------------------------
+# Order execution
+# ---------------------------------------------------------------------------
+
+def execute_setup(
+    client: PublicApiClient,
+    setup: Dict,
+    sizing: Dict,
+    dry_run: bool = True,
+) -> Dict:
+    """
+    Place entry order (LIMIT) for a single setup.
+
+    For BREAK_LONG: BUY at limit = entry price (zone center retest)
+    For BREAK_SELL: SELL at limit = entry price
+
+    Returns execution result dict.
+    """
+    ticker = setup["ticker"]
+    entry = setup["entry"]
+    stop = setup["stop"]
+    shares = sizing["shares"]
+    setup_type = setup["type"]
+
+    side = OrderSide.BUY if "LONG" in setup_type else OrderSide.SELL
+    side_str = "BUY" if "LONG" in setup_type else "SELL"
+
+    result = {
+        "ticker": ticker,
+        "type": setup_type,
+        "side": side_str,
+        "shares": shares,
+        "entry": entry,
+        "stop": stop,
+        "score": setup["score"],
+        "levels": setup["levels"],
+        "position_value": sizing["position_value"],
+        "risk_dollars": sizing["risk_dollars"],
+        "timestamp": datetime.now().isoformat(),
+        "status": "DRY_RUN",
+        "entry_order_id": None,
+        "stop_order_id": None,
+        "errors": [],
+    }
+
+    if dry_run:
+        print(f"  [DRY RUN] {side_str} {shares} x {ticker} @ ${entry:.2f} "
+              f"(stop ${stop:.2f}) — score {setup['score']} [{setup['levels']}]")
+        print(f"            Risk: ${sizing['risk_dollars']:.2f} | "
+              f"Position: ${sizing['position_value']:,.2f}")
+        return result
+
+    # --- LIVE EXECUTION ---
+
+    # Step 1: Place entry order (LIMIT, GTC so it persists overnight if needed)
+    try:
+        entry_order_id = str(uuid.uuid4())
+        entry_request = OrderRequest(
+            order_id=entry_order_id,
+            instrument=OrderInstrument(
+                symbol=ticker,
+                type=InstrumentType.EQUITY,
+            ),
+            order_side=side,
+            order_type=OrderType.LIMIT,
+            quantity=shares,
+            limit_price=Decimal(str(round(entry, 2))),
+            expiration=OrderExpirationRequest(time_in_force=TimeInForce.DAY),
+        )
+        entry_response = client.place_order(entry_request)
+        result["entry_order_id"] = entry_response.order_id
+        result["status"] = "ENTRY_PLACED"
+        print(green(f"  ENTRY ORDER PLACED: {side_str} {shares} x {ticker} "
+                     f"@ ${entry:.2f} — ID: {entry_response.order_id}"))
+    except Exception as e:
+        result["status"] = "ENTRY_FAILED"
+        result["errors"].append(f"Entry order failed: {str(e)}")
+        print(red(f"  ENTRY FAILED: {ticker} — {e}"))
+        return result
+
+    # Step 2: Place protective stop order
+    # For BREAK_LONG (BUY): stop is a SELL STOP below entry
+    # For BREAK_SELL (SELL): stop is a BUY STOP above entry
+    try:
+        stop_side = OrderSide.SELL if "LONG" in setup_type else OrderSide.BUY
+        stop_order_id = str(uuid.uuid4())
+        stop_request = OrderRequest(
+            order_id=stop_order_id,
+            instrument=OrderInstrument(
+                symbol=ticker,
+                type=InstrumentType.EQUITY,
+            ),
+            order_side=stop_side,
+            order_type=OrderType.STOP,
+            quantity=shares,
+            stop_price=Decimal(str(round(stop, 2))),
+            expiration=OrderExpirationRequest(time_in_force=TimeInForce.DAY),
+        )
+        stop_response = client.place_order(stop_request)
+        result["stop_order_id"] = stop_response.order_id
+        result["status"] = "ENTRY_AND_STOP_PLACED"
+        print(green(f"  STOP ORDER PLACED: {'SELL' if 'LONG' in setup_type else 'BUY'} "
+                     f"{shares} x {ticker} @ ${stop:.2f} — ID: {stop_response.order_id}"))
+    except Exception as e:
+        result["errors"].append(f"Stop order failed: {str(e)}")
+        print(yellow(f"  [warn] Stop order failed for {ticker}: {e}"))
+        print(yellow(f"  Entry is live without a stop — MANAGE MANUALLY"))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Execution log
+# ---------------------------------------------------------------------------
+
+def save_execution_log(executions: List[Dict], path: str = EXECUTION_LOG_PATH):
+    """Append execution results to the log file."""
+    existing = []
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, KeyError):
+            existing = []
+
+    existing.extend(executions)
+
+    with open(path, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    print(f"\n[info] Execution log saved → {path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--live", action="store_true",
+        help="Place real orders (default is dry-run)",
+    )
+    parser.add_argument(
+        "--risk-pct", type=float, default=1.0,
+        help="Percent of equity to risk per trade (default: 1.0)",
+    )
+    parser.add_argument(
+        "--min-score", type=int, default=3,
+        help="Minimum confluence score to trade (default: 3)",
+    )
+    parser.add_argument(
+        "--max-positions", type=int, default=8,
+        help="Maximum number of orders to place in one session (default: 8)",
+    )
+    parser.add_argument(
+        "--equity", type=float, default=None,
+        help="Override account equity (default: fetched from Public.com)",
+    )
+    parser.add_argument(
+        "--results-file", type=str, default=RESULTS_PATH,
+        help="Path to scanner results JSON",
+    )
+    parser.add_argument(
+        "--allow-shorts", action="store_true",
+        help="Allow SELL setups (Public.com does not support shorts; off by default)",
+    )
+    args = parser.parse_args()
+
+    # --- Header ---
+    mode = red("LIVE") if args.live else yellow("DRY RUN")
+    print()
+    print(bold("=" * 70))
+    print(bold(f"  MEAN LEVELS EXECUTOR — {mode}"))
+    print(bold(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}"))
+    print(bold(f"  Risk: {args.risk_pct}% | Min Score: {args.min_score} | "
+               f"Max Positions: {args.max_positions}"))
+    print(bold("=" * 70))
+
+    # --- API Setup ---
+    secret = os.environ.get("PUBLIC_COM_SECRET")
+    if not secret:
+        print(red("ERROR: PUBLIC_COM_SECRET not set"))
+        sys.exit(1)
+
+    # --- Get equity ---
+    if args.equity:
+        equity = args.equity
+        print(f"\n[info] Using override equity: ${equity:,.2f}")
     else:
-        print_orders(orders, dry_run=not live_mode)
+        equity = get_live_equity(secret)
+        if equity <= 0:
+            print(red("ERROR: Could not determine account equity. Use --equity to override."))
+            sys.exit(1)
+        print(f"\n[info] Live account equity: ${equity:,.2f}")
 
-    # Apply to state in --live mode
-    if live_mode and orders:
-        for order in orders:
-            open_position(state, order)
-        state["session_count"] += 1
-        save_state(state, args.state_file)
-        print(f"State saved to {args.state_file}")
-        print(f"Opened {len(orders)} position(s).")
-    elif not live_mode and orders:
-        print("(dry-run: state not modified)")
+    risk_per_trade = equity * (args.risk_pct / 100.0)
+    print(f"[info] Risk per trade ({args.risk_pct}%): ${risk_per_trade:,.2f}")
+
+    # --- Load and filter setups ---
+    results = load_scanner_results(args.results_file)
+    long_only = not args.allow_shorts
+    setups = filter_break_setups(results, min_score=args.min_score, long_only=long_only)
+
+    if not setups:
+        print(yellow("\nNo qualifying break setups found. Nothing to execute."))
+        return
+
+    print(f"\n[info] {len(setups)} break setup(s) found (score >= {args.min_score})")
+
+    # Cap at max positions
+    if len(setups) > args.max_positions:
+        print(f"[info] Capping at {args.max_positions} (highest score first)")
+        setups = setups[:args.max_positions]
+
+    # --- Size and display ---
+    print()
+    print(bold(f"{'#':<3} {'TICKER':<7} {'TYPE':<12} {'SCORE':>5} {'LEVELS':<16} "
+               f"{'ENTRY':>8} {'STOP':>8} {'SHARES':>6} {'VALUE':>10} {'RISK':>8}"))
+    print("-" * 100)
+
+    # Fetch buying power for cumulative cap
+    try:
+        bp_client = PublicApiClient(
+            ApiKeyAuthConfig(api_secret_key=secret),
+            config=PublicApiClientConfiguration(default_account_number=ACCOUNT_ID),
+        )
+        portfolio = bp_client.get_portfolio()
+        buying_power = float(portfolio.buying_power.buying_power)
+        bp_client.close()
+        print(f"[info] Available buying power: ${buying_power:,.2f}")
+    except Exception:
+        buying_power = equity * 2.0  # conservative estimate with 2:1 margin
+        print(f"[info] Estimated buying power (2:1 margin): ${buying_power:,.2f}")
+
+    cumulative_notional = 0.0
+    # Use 90% of buying power — reserve 10% as margin buffer
+    usable_bp = buying_power * 0.90
+
+    sized_setups = []
+    for i, setup in enumerate(setups, 1):
+        sizing = size_position(
+            equity=equity,
+            entry=setup["entry"],
+            stop=setup["stop"],
+            risk_pct=args.risk_pct,
+            score=setup["score"],
+        )
+
+        if sizing["shares"] == 0:
+            continue
+
+        # Check if adding this position would exceed usable buying power
+        if cumulative_notional + sizing["position_value"] > usable_bp:
+            print(yellow(f"  [skip] {setup['ticker']} — cumulative notional "
+                         f"(${cumulative_notional + sizing['position_value']:,.2f}) "
+                         f"would exceed usable buying power (${usable_bp:,.2f})"))
+            continue
+
+        cumulative_notional += sizing["position_value"]
+        sized_setups.append((setup, sizing))
+
+        color = green if "LONG" in setup["type"] else red
+        print(color(
+            f"{i:<3} {setup['ticker']:<7} {setup['type']:<12} {setup['score']:>5} "
+            f"{setup['levels']:<16} {setup['entry']:>8.2f} {setup['stop']:>8.2f} "
+            f"{sizing['shares']:>6} ${sizing['position_value']:>9,.2f} "
+            f"${sizing['risk_dollars']:>7,.2f}"
+        ))
+
+    if not sized_setups:
+        print(yellow("\nNo setups passed sizing filters."))
+        return
+
+    total_value = sum(s["position_value"] for _, s in sized_setups)
+    total_risk = sum(s["risk_dollars"] for _, s in sized_setups)
+    print(f"\n{'':3} {'TOTAL':<7} {'':12} {'':>5} {'':16} {'':>8} {'':>8} "
+          f"{'':>6} ${total_value:>9,.2f} ${total_risk:>7,.2f}")
+
+    # --- Execute ---
+    if not args.live:
+        print(yellow(f"\n--- DRY RUN COMPLETE ---"))
+        print(yellow(f"To place real orders, re-run with --live"))
+        print()
+
+        # Still save dry-run log
+        executions = []
+        for setup, sizing in sized_setups:
+            executions.append(execute_setup(None, setup, sizing, dry_run=True))
+        save_execution_log(executions)
+        return
+
+    # Live mode — create client and execute
+    print(bold(f"\n>>> PLACING {len(sized_setups)} LIVE ORDER(S) <<<"))
+    print()
+
+    client = PublicApiClient(
+        ApiKeyAuthConfig(api_secret_key=secret),
+        config=PublicApiClientConfiguration(default_account_number=ACCOUNT_ID),
+    )
+
+    executions = []
+    placed = 0
+    for setup, sizing in sized_setups:
+        result = execute_setup(client, setup, sizing, dry_run=False)
+        executions.append(result)
+        if "PLACED" in result["status"]:
+            placed += 1
+        print()
+
+    client.close()
+
+    print(bold(f"\nExecution complete: {placed}/{len(sized_setups)} orders placed"))
+
+    # Save log
+    save_execution_log(executions)
 
 
 if __name__ == "__main__":
