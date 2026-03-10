@@ -11,8 +11,7 @@ Flow:
   4. If regime = BUY → place limit BUY orders at all 4 mean levels
      If regime = SELL → skip (Public.com can't short)
      If regime = NEUTRAL → skip (no edge)
-  5. Each order gets a protective STOP placed alongside
-  6. Log everything to JSON
+  5. Log everything to JSON
 
 Risk parameters:
   - 1% equity per trade
@@ -20,6 +19,7 @@ Risk parameters:
   - Min confluence score: N/A (orders at all 4 levels individually)
   - Long-only (Public.com constraint)
   - DAY time-in-force (orders expire at close if unfilled)
+  - Buying power aware: tracks remaining BP across all orders (50% margin)
 
 Usage:
   python3 mean_levels_live.py                          # Dry-run (default)
@@ -61,7 +61,7 @@ import importlib.util as _ilu
 
 from public_api_sdk import (
     PublicApiClient, PublicApiClientConfiguration,
-    OrderRequest, PreflightRequest, OrderInstrument,
+    OrderRequest, OrderInstrument,
     InstrumentType, OrderSide, OrderType,
     OrderExpirationRequest, TimeInForce,
 )
@@ -305,15 +305,21 @@ def place_level_orders(
     equity: float,
     risk_pct: float,
     max_orders: int,
+    buying_power_remaining: float,
     dry_run: bool = True,
-) -> List[Dict]:
+) -> Tuple[List[Dict], float]:
     """
     Place limit BUY orders at each mean level that is BELOW current price
-    (buy the dip to the level). Each order gets a stop.
+    (buy the dip to the level).
 
-    Returns list of execution records.
+    NOTE: Stop orders are NOT placed here — Public.com rejects sell stops
+    for shares not yet held. Stops should be managed after fills.
+
+    Returns (list of execution records, updated buying_power_remaining).
     """
     executions = []
+    bp = buying_power_remaining
+    MARGIN_REQ = 0.50  # 50% initial margin requirement
 
     # Sort levels by weight (strongest first): PMM > CMM > PDM > CDM
     level_items = sorted(levels.items(), key=lambda x: LEVEL_WEIGHTS.get(x[0], 0), reverse=True)
@@ -346,6 +352,18 @@ def place_level_orders(
         entry_price = round(level_price, 2)
         shares = sizing["shares"]
 
+        # Check buying power: margin_needed = shares * entry * margin_req
+        margin_needed = shares * entry_price * MARGIN_REQ
+        if margin_needed > bp:
+            # Reduce shares to fit buying power
+            max_shares = int(bp / (entry_price * MARGIN_REQ))
+            if max_shares < 1:
+                print(yellow(f"    {level_name} = ${entry_price:.2f} — insufficient buying power (need ${margin_needed:.0f}, have ${bp:.0f}), skip"))
+                continue
+            shares = max_shares
+            margin_needed = shares * entry_price * MARGIN_REQ
+            print(yellow(f"    {level_name}: sized down to {shares} shares (BP constraint)"))
+
         record = {
             "ticker": ticker,
             "level": level_name,
@@ -353,12 +371,12 @@ def place_level_orders(
             "stop_price": stop_price,
             "shares": shares,
             "risk_dollars": sizing["risk_dollars"],
-            "position_value": sizing["position_value"],
+            "position_value": round(shares * entry_price, 2),
+            "margin_needed": round(margin_needed, 2),
             "weight": weight,
             "distance_pct": round(distance_pct, 2),
             "status": "DRY_RUN",
             "entry_order_id": None,
-            "stop_order_id": None,
             "errors": [],
             "timestamp": datetime.now().isoformat(),
         }
@@ -367,8 +385,9 @@ def place_level_orders(
             print(green(
                 f"    [DRY] BUY {shares} x {ticker} @ ${entry_price:.2f} "
                 f"({level_name}, wt={weight}) stop=${stop_price:.2f} "
-                f"risk=${sizing['risk_dollars']:.2f}"
+                f"risk=${sizing['risk_dollars']:.2f}  margin=${margin_needed:.0f}"
             ))
+            bp -= margin_needed
             executions.append(record)
             orders_placed += 1
             continue
@@ -388,9 +407,10 @@ def place_level_orders(
             resp = client.place_order(entry_req)
             record["entry_order_id"] = resp.order_id
             record["status"] = "ENTRY_PLACED"
+            bp -= margin_needed
             print(green(
                 f"    ENTRY: BUY {shares} x {ticker} @ ${entry_price:.2f} "
-                f"({level_name}) — ID: {resp.order_id[:8]}"
+                f"({level_name}) — ID: {resp.order_id[:8]}  BP left: ${bp:.0f}"
             ))
         except Exception as e:
             record["status"] = "ENTRY_FAILED"
@@ -399,30 +419,10 @@ def place_level_orders(
             executions.append(record)
             continue
 
-        # --- LIVE: Place protective stop ---
-        try:
-            stop_oid = str(uuid.uuid4())
-            stop_req = OrderRequest(
-                order_id=stop_oid,
-                instrument=OrderInstrument(symbol=ticker, type=InstrumentType.EQUITY),
-                order_side=OrderSide.SELL,
-                order_type=OrderType.STOP,
-                quantity=shares,
-                stop_price=Decimal(str(stop_price)),
-                expiration=OrderExpirationRequest(time_in_force=TimeInForce.DAY),
-            )
-            stop_resp = client.place_order(stop_req)
-            record["stop_order_id"] = stop_resp.order_id
-            record["status"] = "ENTRY_AND_STOP_PLACED"
-            print(green(f"    STOP:  SELL {shares} x {ticker} @ ${stop_price:.2f} — ID: {stop_resp.order_id[:8]}"))
-        except Exception as e:
-            record["errors"].append(f"Stop failed: {e}")
-            print(yellow(f"    [warn] Stop failed for {ticker}: {e}"))
-
         executions.append(record)
         orders_placed += 1
 
-    return executions
+    return executions, bp
 
 
 # ---------------------------------------------------------------------------
@@ -476,9 +476,11 @@ def main():
 
     client = get_client(secret)
 
-    # --- Get equity ---
+    # --- Get equity + buying power ---
+    buying_power = 0.0
     if args.equity:
         equity = args.equity
+        buying_power = args.equity  # assume full BP in override mode
     else:
         try:
             portfolio = client.get_portfolio()
@@ -489,6 +491,7 @@ def main():
             sys.exit(1)
 
     print(f"\n[info] Account equity: ${equity:,.2f}")
+    print(f"[info] Buying power:  ${buying_power:,.2f}")
 
     # --- Step 1: Cancel all stale orders ---
     print(bold("\n── STEP 1: Cancel stale orders ──"))
@@ -564,7 +567,7 @@ def main():
 
         # Place limit orders at all 4 levels
         total_buy += 1
-        executions = place_level_orders(
+        executions, buying_power = place_level_orders(
             client=client,
             ticker=ticker,
             price=price,
@@ -572,6 +575,7 @@ def main():
             equity=equity,
             risk_pct=args.risk_pct,
             max_orders=args.max_orders,
+            buying_power_remaining=buying_power,
             dry_run=dry_run,
         )
         ticker_result["orders"] = executions
@@ -592,6 +596,7 @@ def main():
     print(f"  Regime = SKIP:      {total_skip_regime}")
     print(f"  Orders placed:      {total_orders}")
     print(f"  Stale cancelled:    {len(cancelled)}")
+    print(f"  Buying power left:  ${buying_power:,.2f}")
     print(bold("=" * 80))
 
     # Save
@@ -601,6 +606,7 @@ def main():
         "regime_skip": total_skip_regime,
         "orders_placed": total_orders,
         "stale_cancelled": len(cancelled),
+        "buying_power_remaining": round(buying_power, 2),
     }
     save_log(session)
     print(f"\n[info] Log saved → {LOG_PATH}")
